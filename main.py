@@ -15,7 +15,52 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 import json
 import markdown2
+import logging
 
+# 設定日誌
+logging.basicConfig(
+    filename='hexo_editor.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+class ConfigManager:
+    """設定檔管理器"""
+    def __init__(self):
+        self.config_file = Path('editor_config.json')
+        self.config = {
+            'last_directory': '',  # 上次開啟的目錄
+            'window_size': (1200, 800),  # 視窗大小
+            'window_position': (100, 100),  # 視窗位置
+        }
+        self.load_config()
+
+    def load_config(self):
+        """載入設定檔"""
+        try:
+            if self.config_file.exists():
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    saved_config = json.load(f)
+                    self.config.update(saved_config)
+        except Exception as e:
+            logging.error(f"載入設定檔時發生錯誤: {str(e)}")
+
+    def save_config(self):
+        """儲存設定檔"""
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logging.error(f"儲存設定檔時發生錯誤: {str(e)}")
+
+    def get(self, key, default=None):
+        """取得設定值"""
+        return self.config.get(key, default)
+
+    def set(self, key, value):
+        """設定值"""
+        self.config[key] = value
+        self.save_config()
 
 class StyleManager:
     """Qt樣式管理器"""
@@ -33,7 +78,7 @@ class StyleManager:
                 with open(self.style_file, 'r', encoding='utf-8') as f:
                     self.styles = json.load(f)
         except Exception as e:
-            print(f"載入樣式檔案時發生錯誤: {str(e)}")
+            logging.error(f"載入樣式檔案時發生錯誤: {str(e)}")
 
     def save_styles(self):
         """儲存樣式定義到JSON檔"""
@@ -41,7 +86,7 @@ class StyleManager:
             with open(self.style_file, 'w', encoding='utf-8') as f:
                 json.dump(self.styles, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            print(f"儲存樣式檔案時發生錯誤: {str(e)}")
+            logging.error(f"儲存樣式檔案時發生錯誤: {str(e)}")
 
     def add_style(self, name: str, style: str):
         """新增樣式定義"""
@@ -128,7 +173,7 @@ class FileLoader(QThread):
                     self.progress.emit(int((i + 1) / total_files * 100))
 
                 except Exception as e:
-                    print(f"讀取檔案 {md_file} 時發生錯誤: {str(e)}")
+                    logging.error(f"讀取檔案 {md_file} 時發生錯誤: {str(e)}")
 
             # 依日期排序
             articles.sort(key=lambda x: str(x['date']), reverse=True)
@@ -146,6 +191,13 @@ class HexoEditor(QMainWindow):
         self.articles = []
         self.current_file = None
         self.style_manager = StyleManager()
+        self.config_manager = ConfigManager()
+
+        # 載入視窗大小和位置
+        size = self.config_manager.get('window_size', (1200, 800))
+        pos = self.config_manager.get('window_position', (100, 100))
+        self.resize(*size)
+        self.move(*pos)
 
         # 註冊樣式
         self.style_manager.add_style('material-button', '''
@@ -358,6 +410,11 @@ class HexoEditor(QMainWindow):
         splitter.setSizes([300, 900])
         self.apply_styles()
 
+        # 自動載入上次的目錄
+        last_dir = self.config_manager.get('last_directory')
+        if last_dir and Path(last_dir).exists():
+            self.load_directory(last_dir)
+
     def apply_styles(self):
         """套用所有樣式"""
         # 套用到按鈕
@@ -566,25 +623,13 @@ class HexoEditor(QMainWindow):
 
     def save_article(self):
         """儲存文章"""
-        if not self.current_file:
-            # 如果是新文章，需要選擇儲存位置
-            title = self.title_edit.text()
-            if not title:
-                QMessageBox.warning(self, "警告", "請輸入文章標題")
-                return
-
-            filename = title.replace(' ', '-') + '.md'
-            self.current_file = QFileDialog.getSaveFileName(
-                self,
-                "儲存文章",
-                filename,
-                "Markdown Files (*.md)"
-            )[0]
-
-            if not self.current_file:
-                return
+        # 檢查是否已選擇文章目錄
+        if not hasattr(self, 'loader') or not self.loader.directory:
+            QMessageBox.warning(self, "警告", "請先選擇文章目錄")
+            return
 
         try:
+            # 準備文章內容
             content = self.content_edit.toPlainText()
 
             # 如果內容已經包含 front matter，先移除它
@@ -600,6 +645,9 @@ class HexoEditor(QMainWindow):
 
             # 1. title (必填)
             title = self.title_edit.text()
+            if not title:
+                QMessageBox.warning(self, "警告", "請輸入文章標題")
+                return
             front_matter['title'] = title
 
             # 2. date (必填)
@@ -625,6 +673,16 @@ class HexoEditor(QMainWindow):
             # 組合最終內容
             final_content = f"---\n{yaml_content}---\n\n{content}"
 
+            # 如果是新文章，根據標題生成檔案名稱
+            if not self.current_file:
+                # 將標題轉換為合法的檔案名稱（移除特殊字元，用連字號取代空格）
+                filename = title.replace(' ', '-')
+                filename = ''.join(c for c in filename if c.isalnum() or c in ('-', '_'))
+                filename = filename.lower() + '.md'
+
+                # 組合完整路徑
+                self.current_file = str(Path(self.loader.directory) / filename)
+
             # 儲存檔案
             with open(self.current_file, 'w', encoding='utf-8') as f:
                 f.write(final_content)
@@ -639,9 +697,6 @@ class HexoEditor(QMainWindow):
                         'categories': categories,
                         'tags': tags
                     })
-                    # 更新列表顯示
-                    display_text = f"{title} ({date})"
-                    self.article_list.item(i).setText(display_text)
                     break
             else:
                 # 如果是新文章，新增到列表
@@ -653,7 +708,14 @@ class HexoEditor(QMainWindow):
                     'tags': tags
                 }
                 self.articles.append(new_article)
-                display_text = f"{title} ({date})"
+
+            # 根據日期重新排序文章列表
+            self.articles.sort(key=lambda x: str(x['date']), reverse=True)
+
+            # 更新列表顯示
+            self.article_list.clear()
+            for article in self.articles:
+                display_text = f"{article['title']} ({article['date']})"
                 self.article_list.addItem(display_text)
 
             self.show_notification("✓ 文章已儲存")
@@ -661,19 +723,33 @@ class HexoEditor(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "錯誤", f"儲存文章時發生錯誤：{str(e)}")
 
+    def closeEvent(self, event):
+        """關閉視窗時儲存設定"""
+        # 儲存視窗大小和位置
+        self.config_manager.set('window_size', (self.width(), self.height()))
+        self.config_manager.set('window_position', (self.x(), self.y()))
+        event.accept()
+
     def select_directory(self):
         """選擇HEXO文章目錄"""
         directory = QFileDialog.getExistingDirectory(self, "選擇HEXO文章目錄")
         if directory:
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
+            self.load_directory(directory)
 
-            # 建立並啟動檔案載入器
-            self.loader = FileLoader(directory)
-            self.loader.finished.connect(self.update_article_list)
-            self.loader.error.connect(self.show_error)
-            self.loader.progress.connect(self.update_progress)
-            self.loader.start()
+    def load_directory(self, directory):
+        """載入指定目錄"""
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+
+        # 儲存目錄路徑到設定檔
+        self.config_manager.set('last_directory', directory)
+
+        # 建立並啟動檔案載入器
+        self.loader = FileLoader(directory)
+        self.loader.finished.connect(self.update_article_list)
+        self.loader.error.connect(self.show_error)
+        self.loader.progress.connect(self.update_progress)
+        self.loader.start()
 
     def update_progress(self, value):
         """更新進度條"""
@@ -1420,7 +1496,7 @@ class ExportThread(QThread):
                         progress = int((i + 1) / total_files * 100)
                         self.progress.emit(progress)
                     except Exception as e:
-                        print(f"無法加入檔案 {full_path}: {str(e)}")
+                        logging.error(f"無法加入檔案 {full_path}: {str(e)}")
                         continue
 
             self.finished.emit()
